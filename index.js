@@ -24,6 +24,8 @@ const state = {
     poller: null,
     idlePolls: 0,
     selfStopping: false,
+    snap: null,          // chat snapshot taken when an attempt begins
+    gotMessage: false,   // MESSAGE_RECEIVED fired during this attempt
 };
 
 function ctx() {
@@ -73,6 +75,36 @@ function lastMessageOk() {
     return true;
 }
 
+function takeSnap() {
+    const { chat } = ctx();
+    const last = chat[chat.length - 1];
+    return {
+        len: chat.length,
+        swipes: last?.swipes?.length ?? 0,
+        mes: String(last?.mes ?? ''),
+    };
+}
+
+// Looks like an error page/message rather than a real reply?
+function looksLikeError(text) {
+    return /^\s*(chat completion request error|<!doctype html|<html|\{\s*"error")/i.test(text);
+}
+
+// The attempt only counts if it produced NEW, valid content. On a failed swipe or
+// regenerate, ST can leave the previous reply on screen, which would otherwise
+// look like a success.
+function attemptSucceeded() {
+    if (!lastMessageOk()) return false;
+    const { chat } = ctx();
+    const text = String(chat[chat.length - 1].mes ?? '');
+    if (looksLikeError(text)) return false;
+
+    const now = takeSnap();
+    const was = state.snap;
+    const changed = !was || now.len !== was.len || now.swipes > was.swipes || now.mes !== was.mes;
+    return state.gotMessage || changed;
+}
+
 // ---------- loop control ----------
 
 function clearTimers() {
@@ -112,6 +144,8 @@ function beginAttempt() {
     const s = settings();
     state.generating = true;
     state.idlePolls = 0;
+    state.snap = takeSnap();
+    state.gotMessage = false;
     clearTimeout(state.watchdog);
     state.watchdog = setTimeout(() => {
         if (!state.active || !state.generating) return;
@@ -135,7 +169,7 @@ function onAttemptFinished() {
     // Give ST a moment to render/save the message before inspecting it.
     setTimeout(() => {
         if (!state.active) return;
-        if (lastMessageOk()) {
+        if (attemptSucceeded()) {
             const n = state.attempts;
             stopLoop(`Success after ${n} attempt${n === 1 ? '' : 's'}`, 'success');
         } else {
@@ -202,7 +236,13 @@ function onGenerationStarted(type, _params, dryRun) {
         state.active = true;
         state.attempts = 1;
     }
-    beginAttempt();
+    // If we triggered this attempt ourselves, it was already set up (and the
+    // pre-attempt snapshot taken) in triggerRegenerate().
+    if (!state.generating) beginAttempt();
+}
+
+function onMessageReceived() {
+    if (state.active && state.generating) state.gotMessage = true;
 }
 
 function onGenerationStopped() {
@@ -302,6 +342,7 @@ jQuery(async () => {
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_STOPPED, onGenerationStopped);
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
+    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     // Switching chats aborts any running loop.
     eventSource.on(event_types.CHAT_CHANGED, () => { if (state.active) stopLoop('Chat changed'); });
 
